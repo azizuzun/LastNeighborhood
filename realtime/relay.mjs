@@ -6,7 +6,7 @@ import { guestFrame } from '../lib/city-frame.mjs';
 import { hydrateCheckpoint } from '../public/game/checkpoint-codec.js';
 import { encodeState, decodeState } from '../public/game/state-patch.js';
 
-export function createRelay({origin, region, maxRooms=100}){
+export function createRelay({origin, region, maxRooms=100,clock=Date.now,verifyAdmin}){
   const rooms=new Map();
   const server=createServer((req,res)=>{
     res.writeHead(req.url==='/health'?200:404,{'Content-Type':'application/json'});
@@ -29,11 +29,34 @@ export function createRelay({origin, region, maxRooms=100}){
         weapon:text(entry.weapon,24),x:number(entry.x),y:number(entry.y),angle:number(entry.angle)};
       room.commands.push({id:++room.sequence,player:player.id,body:JSON.stringify(command)});
     }
+    // Commands remain queued until the host acknowledges them. Push the same IDs
+    // immediately, so normal polling is a recovery path rather than input latency.
+    const host=room.players.get(room.host);
+    if(host?.socket?.readyState===1&&room.commands.length)
+      host.socket.send(JSON.stringify({event:'commands',room:room.id,commands:room.commands.slice(0,80)}));
   }
 
-  function dispatch(client,b){
-    const now=Date.now();
+  const adminCheck=verifyAdmin|| (async key=>{
+    const response=await fetch(origin+'/api/wave-admin',{method:'POST',headers:{'Content-Type':'application/json','Origin':origin},body:JSON.stringify({key}),signal:AbortSignal.timeout(5000)});
+    return response.status===204;
+  });
+  function pruneRooms(now=clock()){
+    for(const [id,room] of rooms){
+      for(const [pid,player] of room.players)if(now-player.seen>60_000){room.updated=Math.max(room.updated,player.seen);room.players.delete(pid);}
+      if(![...room.players.values()].some(p=>active(p,now))&&now-room.updated>=10*60_000)rooms.delete(id);
+    }
+  }
+  server.pruneRooms=pruneRooms;
+  async function dispatch(client,b){
+    const now=clock();
     if(b.op==='ping')return {region};
+    if(b.op==='list'||b.op==='join')pruneRooms(now);
+    if(b.op==='close'){
+      if(typeof b.key!=='string'||b.key.length>128||now<(client.adminAfter||0))throw Error('admin_required');
+      client.adminAfter=now+2000;
+      if(!await adminCheck(b.key))throw Error('admin_required');
+      const id=text(b.room,6).toUpperCase();if(!rooms.has(id))throw Error('lobby_not_found');rooms.delete(id);return {ok:true,closed:id};
+    }
     const mode=b.gameMode==='waves'?'waves':'city';
     if(b.op==='list')return {rooms:[...rooms.values()].filter(room=>room.mode===mode)
       .map(room=>({id:room.id,name:room.name,players:[...room.players.values()].filter(p=>active(p,now)).length})).slice(-20)};
@@ -51,7 +74,8 @@ export function createRelay({origin, region, maxRooms=100}){
       if(room.players.size>=24)throw Error('lobby_full');
       const player={id:randomUUID(),token:randomUUID()+randomUUID(),name:text(b.name,24)||'Survivor',
         x:405,y:540,angle:0,seen:now,actionWindow:now,actionCount:0,room:room.id};
-      room.players.set(player.id,player);
+      player.socket=client.socket;
+      room.players.set(player.id,player);room.updated=now;
       client.player=player;
       return {id:player.id,token:player.token,room:room.id,lobbyName:room.name,region};
     }
@@ -60,13 +84,15 @@ export function createRelay({origin, region, maxRooms=100}){
       const player=room?.players.get(b.id);
       if(!player||player.token!==b.token)throw Error('session_expired');
       client.player=player;
+      player.socket=client.socket;
       return {ok:true};
     }
     const player=client.player;
     const room=rooms.get(player?.room);
-    if(!room||room.players.get(player.id)!==player||player.id!==b.id)throw Error('session_expired');
+    if(!room)throw Error('lobby_closed');
+    if(room.players.get(player.id)!==player||player.id!==b.id)throw Error('session_expired');
     if(b.op==='leave'){
-      room.players.delete(player.id);
+      room.players.delete(player.id);room.updated=now;
       if(room.host===player.id)room.host=null;
       client.player=null;
       return {ok:true};
@@ -151,35 +177,32 @@ export function createRelay({origin, region, maxRooms=100}){
     sockets.handleUpgrade(req,socket,head,ws=>sockets.emit('connection',ws));
   });
   sockets.on('connection',socket=>{
-    const client={player:null};
+    const client={player:null,socket};
     let window=0, messages=0;
     socket.on('error',()=>socket.terminate());
     socket.on('pong',()=>{socket.alive=true;});
     socket.alive=true;
-    socket.on('message',(raw,binary)=>{
-      const now=Date.now();
+    socket.on('message',async (raw,binary)=>{
+      const now=clock();
       if(now-window>=1000){window=now;messages=0;}
       if(binary||++messages>65||socket.bufferedAmount>2_000_000){socket.close(1008);return;}
       let packet;
       try{
         packet=JSON.parse(raw);
         if(!Number.isInteger(packet?.seq)||!packet.body)throw Error('packet');
-        socket.send(JSON.stringify({seq:packet.seq,data:dispatch(client,packet.body)}));
+        socket.send(JSON.stringify({seq:packet.seq,data:await dispatch(client,packet.body)}));
       }catch(error){
         if(Number.isInteger(packet?.seq))socket.send(JSON.stringify({seq:packet.seq,error:error.message}));
       }
     });
   });
   const cleanup=setInterval(()=>{
-    const now=Date.now();
+    const now=clock();
     for(const socket of sockets.clients){
       if(!socket.alive){socket.terminate();continue;}
       socket.alive=false;socket.ping();
     }
-    for(const [id,room] of rooms){
-      for(const [pid,player] of room.players)if(now-player.seen>60_000)room.players.delete(pid);
-      if(now-room.updated>15*60_000)rooms.delete(id);
-    }
+    pruneRooms(now);
   },15000);
   cleanup.unref();
   server.on('close',()=>{clearInterval(cleanup);sockets.close();});
