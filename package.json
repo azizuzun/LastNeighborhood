@@ -1,0 +1,14 @@
+{
+  "name": "son-mahalle-coop",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "start": "node realtime/start.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
