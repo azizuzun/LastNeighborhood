@@ -4,6 +4,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { guestFrame } from '../lib/city-frame.mjs';
 import { hydrateCheckpoint } from '../public/game/checkpoint-codec.js';
+import { encodeState, decodeState } from '../public/game/state-patch.js';
 
 export function createRelay({origin, region, maxRooms=100}){
   const rooms=new Map();
@@ -11,7 +12,7 @@ export function createRelay({origin, region, maxRooms=100}){
     res.writeHead(req.url==='/health'?200:404,{'Content-Type':'application/json'});
     res.end(JSON.stringify({region}));
   });
-  const sockets=new WebSocketServer({noServer:true,maxPayload:1_800_000,perMessageDeflate:false});
+  const sockets=new WebSocketServer({noServer:true,maxPayload:1_800_000,perMessageDeflate:{threshold:512,concurrencyLimit:4,serverNoContextTakeover:true,clientNoContextTakeover:true,zlibDeflateOptions:{level:3,memLevel:7}}});
   const active=(player,now)=>now-player.seen<12000;
   const text=(v,n)=>String(v??'').replace(/[<>&"']/g,'').slice(0,n);
   const actions=new Set(['door','class','respawn','relocate','medicine','craftbomb','explosive','step','fire','interact','rescue','assign','place','wall','upgrade','improve','repair','heal','autobuild','wavepick']);
@@ -90,8 +91,11 @@ export function createRelay({origin, region, maxRooms=100}){
     if(b.visible!==false&&(!room.host||now-room.hostSeen>2500))room.host=player.id;
     const host=room.host===player.id;
     if(host)room.hostSeen=now;
-    if(host&&b.snapshot){
-      const snapshot=hydrateCheckpoint(b.snapshot,room.snapshot);
+    if(host&&(b.snapshot||b.snapshotWire)){
+      const packed=b.snapshotWire
+        ? decodeState(b.snapshotWire,client.uploadState,client.uploadRevision)
+        : b.snapshot;
+      const snapshot=hydrateCheckpoint(packed,room.snapshot);
       if(!Array.isArray(snapshot.buildings)||!Array.isArray(snapshot.zombies)||!Array.isArray(snapshot.avatars)||!snapshot.res)throw Error('invalid_world');
       for(const avatar of snapshot.avatars){
         const target=room.players.get(avatar.id);
@@ -102,6 +106,13 @@ export function createRelay({origin, region, maxRooms=100}){
         }
       }
       room.snapshot=snapshot;
+      if(b.snapshotWire){
+        client.uploadState=packed;
+        client.uploadRevision=b.snapshotWire.revision;
+      }else if(b.wireVersion===1){
+        client.uploadState=packed;
+        client.uploadRevision=b.snapshotVersion;
+      }
       room.revision++;
       if(Number.isInteger(b.ack))room.commands=room.commands.filter(c=>c.id>b.ack);
       if(Array.isArray(b.results))for(const result of b.results.slice(0,50)){
@@ -114,8 +125,22 @@ export function createRelay({origin, region, maxRooms=100}){
     const snapshot=room.snapshot&&!unchanged?(host?(b.wasHost?null:room.snapshot):guestFrame(room.snapshot,b,players)):null;
     const result=player.result;
     player.result=null;
-    return {room:room.id,lobbyName:room.name,host,revision:room.revision,geometryId:room.snapshot?.geometryId||'',
+    const response={room:room.id,lobbyName:room.name,host,revision:room.revision,geometryId:room.snapshot?.geometryId||'',
       snapshot,unchanged,players,commands:host?room.commands.slice(0,80):[],result,serverTime:now};
+    if(b.wireVersion===1){
+      response.wireVersion=1;
+      response.snapshotAck=client.uploadRevision||0;
+      if(snapshot){
+        const compatible=b.frameAck===client.frameRevision;
+        const next=(client.frameRevision||0)+1;
+        const frame=encodeState(snapshot,compatible?client.frameState:null,client.frameRevision,next);
+        response.snapshot=null;
+        response.snapshotWire=frame.wire;
+        client.frameState=frame.state;
+        client.frameRevision=next;
+      }
+    }
+    return response;
   }
 
   server.on('upgrade',(req,socket,head)=>{
