@@ -1,4 +1,5 @@
 
+import { createTurnProvider } from './turn.mjs';
 import { createServer } from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
@@ -6,11 +7,11 @@ import { guestFrame } from '../lib/city-frame.mjs';
 import { hydrateCheckpoint } from '../public/game/checkpoint-codec.js';
 import { encodeState, decodeState } from '../public/game/state-patch.js';
 
-export function createRelay({origin, region, maxRooms=100,clock=Date.now,verifyAdmin}){
-  const rooms=new Map();
+export function createRelay({origin, region, maxRooms=100,clock=Date.now,verifyAdmin,turnKeyId,turnApiToken,turnRequest}){
+  const rooms=new Map(),turn=createTurnProvider({keyId:turnKeyId,apiToken:turnApiToken,clock,request:turnRequest,maxUsers:maxRooms*24});
   const server=createServer((req,res)=>{
     res.writeHead(req.url==='/health'?200:404,{'Content-Type':'application/json'});
-    res.end(JSON.stringify({region,protocol:2,features:['command-push','webrtc-signaling']}));
+    res.end(JSON.stringify({region,protocol:2,features:['command-push','webrtc-signaling',...(turn.enabled?['turn-credentials']:[])],turn:turn.enabled}));
   });
   const sockets=new WebSocketServer({noServer:true,maxPayload:1_800_000,perMessageDeflate:{threshold:512,concurrencyLimit:4,serverNoContextTakeover:true,clientNoContextTakeover:true,zlibDeflateOptions:{level:3,memLevel:7}}});
   const active=(player,now)=>now-player.seen<12000;
@@ -42,7 +43,7 @@ export function createRelay({origin, region, maxRooms=100,clock=Date.now,verifyA
   });
   function pruneRooms(now=clock()){
     for(const [id,room] of rooms){
-      for(const [pid,player] of room.players)if(now-player.seen>60_000){room.updated=Math.max(room.updated,player.seen);room.players.delete(pid);}
+      for(const [pid,player] of room.players)if(now-player.seen>60_000){room.updated=Math.max(room.updated,player.seen);room.players.delete(pid);turn.remove(pid);}
       if(![...room.players.values()].some(p=>active(p,now))&&now-room.updated>=10*60_000)rooms.delete(id);
     }
   }
@@ -91,8 +92,9 @@ export function createRelay({origin, region, maxRooms=100,clock=Date.now,verifyA
     const room=rooms.get(player?.room);
     if(!room)throw Error('lobby_closed');
     if(room.players.get(player.id)!==player||player.id!==b.id)throw Error('session_expired');
+    if(b.op==='ice')return await turn.get(player.id);
     if(b.op==='leave'){
-      room.players.delete(player.id);room.updated=now;
+      room.players.delete(player.id);turn.remove(player.id);room.updated=now;
       if(room.host===player.id)room.host=null;
       client.player=null;
       return {ok:true};
@@ -166,7 +168,7 @@ export function createRelay({origin, region, maxRooms=100,clock=Date.now,verifyA
     const snapshot=room.snapshot&&!unchanged?(host?(b.wasHost?null:room.snapshot):guestFrame(room.snapshot,b,players)):null;
     const result=player.result;
     player.result=null;
-    const response={room:room.id,lobbyName:room.name,host,hostId:room.host,rtc:true,revision:room.revision,geometryId:room.snapshot?.geometryId||'',
+    const response={room:room.id,lobbyName:room.name,host,hostId:room.host,rtc:true,turn:turn.enabled,revision:room.revision,geometryId:room.snapshot?.geometryId||'',
       snapshot,unchanged,players,commands:host?room.commands.slice(0,80):[],result,serverTime:now};
     if(b.wireVersion===1){
       response.wireVersion=1;
