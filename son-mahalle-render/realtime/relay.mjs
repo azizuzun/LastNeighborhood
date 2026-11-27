@@ -186,7 +186,7 @@ export function createRelay({origin, region, maxRooms=100,clock=Date.now,verifyA
     return response;
   }
 
-  server.on('upgrade',(req,socket,head)=>{
+  server.on('upgrade',(req,socket,head)=>{socket.on('error',()=>socket.destroy());/* a client resetting a rejected upgrade must not crash the process */
     if(req.url!=='/coop'||req.headers.origin!==origin||sockets.clients.size>=maxRooms*24){
       socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
       return;
